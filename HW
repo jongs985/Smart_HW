@@ -1,0 +1,412 @@
+
+
+
+
+# <정렬 순서>
+# 가변저항기(볼륨)
+# 스위치
+# 릴레이
+# LED
+# 부저
+
+
+
+
+# 공통 import
+import time                         # 'time'모듈을 불러옴
+import threading
+import queue
+
+# 가변저항기(볼륨) import
+import spidev
+import os
+
+# 릴레이 import
+import RPi.GPIO as GPIO             # 'Rpi.GPIO'모듈을 GPIO라는 이름으로 불러옴(import)  
+
+# LED, 부저 import
+from board import SCL, SDA
+import busio
+from adafruit_pca9685 import PCA9685
+
+
+
+
+
+
+
+
+# 가변저항기(볼륨) 설정
+spi = spidev.SpiDev() 
+spi.open(0,0) 
+spi.max_speed_hz = 500000
+spi.mode = 0
+
+
+# 스위치, 릴레이 설정
+GPIO.setmode(GPIO.BCM)              # 핀번호체계를 'BCM GPIO'로 설정
+GPIO.setwarnings(False)
+relay_port = (22,23,24,25) # gpio pin number
+
+for gpio_pin in relay_port: # setup gpio OUT, 초기출력은 '0'
+    GPIO.setup(gpio_pin, GPIO.OUT, GPIO.PUD_OFF, 0)
+
+idi_1 = 20 # ECS-220 제어기의 GPIO IDI1핀번호
+idi_2 = 21 # ECS-220 제어기의 GPIO IDI2핀번호
+GPIO.setup(idi_1, GPIO.IN)
+GPIO.setup(idi_2, GPIO.IN)
+ 
+button_pin = idi_1                  # idi_1을 button 채널 정의함
+GPIO.setup(button_pin, GPIO.IN)     # 입력포트로 설정
+
+SW_ON = False      # low level signal
+SW_OFF = True      # high level signal
+
+
+# LED, 부저 설정
+i2c = busio.I2C(SCL, SDA)
+pca = PCA9685(i2c)
+pca.frequency = 400
+
+
+
+
+
+
+
+
+# 가변저항기(볼륨) 쓰레드
+def volume_task():
+    level = 0
+    preLevel = 0
+
+    while True:
+        # 종료 플래그
+        if stop:
+            break
+
+        # 기능        
+        adc = ReadAdc(7) # 2~745가 나옴
+
+        if adc <= 150:
+            level = 1
+        elif adc <= 300:
+            level = 2
+        elif adc <= 450:
+            level = 3
+        elif adc <= 600:
+            level = 4
+        else:
+            level = 5
+
+        # 메시지 보내기
+        if level != preLevel:
+            relay_level_message.put(level)
+            led_message.put(level)
+            buzzer_message.put(level)
+            preLevel = level
+
+        time.sleep(0.1)
+
+# 가변저항기(볼륨) 값 받기
+def ReadAdc(chNum):
+        if chNum > 7 or chNum < 0:
+            return -1
+        adc = spi.xfer2 ([1, (8+chNum) << 4, 0]) 
+        data = ((adc[1] & 3) << 8) + adc [2] 
+        return data
+
+
+
+
+# 스위치 쓰레드
+def switch_task():
+    button_status_old = SW_OFF
+    rising_edge = 0
+    falling_edge = 0
+    toggle_cnt = 0
+    key_timer_on = 0
+    key_timer = 0
+    key_hold_timer = 0
+
+    Key_Scan_Interval = 0.1 # 100 msec
+    Follow_Key_Interval = 10 # 1.0 sec
+    
+    while True:
+        # 종료 플래그
+        if stop: 
+            break
+
+        # 기능
+        button_status = GPIO.input(button_pin)
+        if (button_status_old == SW_OFF) & (button_status == SW_ON):    # switch rising edge
+            rising_edge = 1; falling_edge = 0
+        if (button_status_old == SW_ON) & (button_status == SW_OFF):    # switch falling edge
+           rising_edge = 0; falling_edge = 1
+           
+        button_status_old = button_status
+   
+        if rising_edge == 1:
+            key_hold_timer += 1
+   
+        if falling_edge == 1 :    # Switch OFF
+            falling_edge = 0
+            if (key_hold_timer <= 20):
+                toggle_cnt += 1
+                key_timer = 0
+                key_timer_on = 1
+            else:
+                relay_count_message.put('stop') # 메시지 보내기(to relay_task)
+            key_hold_timer = 0
+                
+        if key_timer_on == 1 : 
+            key_timer += 1
+            if key_timer >= Follow_Key_Interval :
+                key_timer_on = 0
+                key_timer = 0
+                
+                relay_count_message.put(toggle_cnt) # 메시지 보내기(to relay_task)
+                
+                toggle_cnt = 0
+
+        time.sleep(Key_Scan_Interval)  # Key scan cycle
+
+
+
+
+# 릴레이 쓰레드
+def relay_task():
+    count = 1
+    num = 0
+    T = 0.5
+    time.sleep(0.5)
+    
+    while True:
+        # 종료 플래그
+        if stop:
+            for gpio_pin in relay_port: # Relay(1~4) OFF
+                GPIO.output(gpio_pin, False)
+            break
+
+        # 메시지 받기(from switch_task)
+        while not relay_count_message.empty():
+            count = relay_count_message.get()
+
+            if count == 1:
+                num = 0
+                
+            elif count == 2:
+                num = 3
+                
+            elif count == 3: # Relay(1~4) OFF
+                for gpio_pin in relay_port:
+                    GPIO.output(gpio_pin, False)
+                    
+            elif count == 4: # Relay(1, 2) OFF / Relay(3, 4) ON
+                GPIO.output(relay_port[0], False)
+                GPIO.output(relay_port[1], False)
+                GPIO.output(relay_port[2], True)
+                GPIO.output(relay_port[3], True)
+                
+            elif count == 5: # Relay(홀수) OFF / Relay(짝수) ON
+                GPIO.output(relay_port[0], False)
+                GPIO.output(relay_port[1], True)
+                GPIO.output(relay_port[2], False)
+                GPIO.output(relay_port[3], True)
+
+            elif count == 'stop': # Relay(1~4) OFF
+                for gpio_pin in relay_port:
+                    GPIO.output(gpio_pin, False)
+
+        # 메시지 받기(from volume_task)
+        while not relay_level_message.empty():
+            level = relay_level_message.get()
+
+            if level == 1:
+                T = 0.5
+            elif level == 2:
+                T = 0.4
+            elif level == 3:
+                T = 0.3
+            elif level == 4:
+                T = 0.2
+            elif level == 5:
+                T = 0.1
+
+        # 기능
+        if count == 1:
+            for gpio_pin in relay_port: # Relay(1~4) OFF
+                GPIO.output(gpio_pin, False)
+            GPIO.output(relay_port[num], True)
+            num = num + 1
+            if num > 3:
+                num = 0
+                
+        elif count == 2:
+            for gpio_pin in relay_port: # Relay(1~4) OFF
+                GPIO.output(gpio_pin, False)
+            GPIO.output(relay_port[num], True)
+            num = num - 1
+            if num < 0:
+                num = 3
+                
+        elif count == 3 or count == 4 or count == 5:
+            for gpio_pin in relay_port: # Relay(1~4) 상태 반전
+                GPIO.output(gpio_pin, not GPIO.input(gpio_pin))
+
+        time.sleep(T)
+
+
+
+
+# LED 쓰레드
+def led_task():
+    trd = threading.Thread(target = led_message_thread)
+    trd.start()
+    time.sleep(0.5)
+    
+    while True:
+        # 종료 플래그
+        if stop:
+            for ch in range(1, 4):
+                pca.channels[ch].duty_cycle = 0
+            break
+
+        # 기능
+        for ch in range(0, 3):
+            if stop:
+                break
+            
+            for percent in range(0,101,ledSpeed):
+                if stop:
+                    break
+                pca.channels[ch + 1].duty_cycle = int(round((100 - percent)/100 * 0xFFFF))
+                pca.channels[((ch + 1) % 3) + 1].duty_cycle = int(round((percent)/100 * 0xFFFF))
+                time.sleep(0.01)            
+
+
+
+
+# LED 메시지큐 읽기 쓰레드
+def led_message_thread():
+    global ledSpeed
+    ledSpeed = 1
+    time.sleep(0.5)
+        
+    while True:
+        m = led_message.get()
+            
+        if m == 1:
+            ledSpeed = 1
+        elif m == 2:
+            ledSpeed = 2
+        elif m == 3:
+            ledSpeed = 3
+        elif m == 4:
+            ledSpeed = 4
+        elif m == 5:
+            ledSpeed = 5
+
+
+
+
+# 부저 쓰레드
+def buzzer_task():
+    # 안 되면 global pca
+    buzzerDelay = 0.5
+    pca.channels[0].duty_cycle = 0x000
+    time.sleep(0.5)
+    
+    while True:
+        # 종료 플래그
+        if stop:
+            pca.channels[0].duty_cycle = 0x000
+            break
+
+        # 메시지 받기
+        while not buzzer_message.empty():
+            m = buzzer_message.get()
+            
+            if m == 1:
+                buzzerDelay = 0.5
+            elif m == 2:
+                buzzerDelay = 0.4
+            elif m == 3:
+                buzzerDelay = 0.3
+            elif m == 4:
+                buzzerDelay = 0.2
+            elif m == 5:
+                buzzerDelay = 0.1
+
+        # 기능
+        if pca.channels[0].duty_cycle > 0x000: # 부저가 on이면 off로, off면 on으로 전환
+            pca.channels[0].duty_cycle = 0x000
+        else:
+            pca.channels[0].duty_cycle = 0x100
+        
+        time.sleep(buzzerDelay)
+
+
+
+
+
+
+
+
+# 종료 플래그 비활성화
+stop = False
+
+# 메시지큐 생성
+relay_count_message = queue.Queue(5)  # 릴레이 메시지큐
+relay_level_message = queue.Queue(5)  # 릴레이 메시지큐
+led_message = queue.Queue(5)  # LED 메시지큐
+buzzer_message = queue.Queue(5)  # 부저 메시지큐
+
+# 쓰레드 생성
+thread_volume = threading.Thread(target = volume_task)
+thread_switch = threading.Thread(target = switch_task)
+thread_relay = threading.Thread(target = relay_task)
+thread_led = threading.Thread(target = led_task)
+thread_buzzer = threading.Thread(target = buzzer_task)
+
+# 쓰레드 실행
+thread_volume.start()
+thread_switch.start()
+thread_relay.start()
+thread_led.start()
+thread_buzzer.start()
+
+
+
+
+
+
+
+
+
+try:
+    while True:
+        time.sleep(0.1)
+except KeyboardInterrupt:
+    print("사용자에 의해 종료됨.")
+
+
+# 종료 플래그 활성화
+stop = True
+
+
+time.sleep(1)
+
+
+# 릴레이 끄기
+for gpio_pin in relay_port:
+    GPIO.output(gpio_pin, False)
+# LED 끄기
+for ch in range(1, 4):
+    pca.channels[ch].duty_cycle = 0
+# 부저 끄기
+pca.channels[0].duty_cycle = 0x000
+
+
+GPIO.cleanup()      # GPIO 포트를 초기화
+print("STOP")
